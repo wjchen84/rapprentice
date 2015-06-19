@@ -1,8 +1,8 @@
 import numpy as np
 
-cx = 320.-.5
-cy = 240.-.5
-DEFAULT_F = 535.
+cx = 960.-.5
+cy = 540.-.5
+DEFAULT_F = 1081.37 #535.
 
 def xyZ_to_XY(x,y,Z,f=DEFAULT_F):
     X = (x - cx)*(Z/f)
@@ -15,12 +15,19 @@ def XYZ_to_xy(X,Y,Z,f=DEFAULT_F):
     return (x,y)
 
 def depth_to_xyz(depth,f=DEFAULT_F):
-    x,y = np.meshgrid(np.arange(640), np.arange(480))
-    assert depth.shape == (480, 640)
-    XYZ = np.empty((480,640,3))
-    Z = XYZ[:,:,2] = depth / 1000. # convert mm -> meters
-    XYZ[:,:,0] = (x - cx)*(Z/f)
-    XYZ[:,:,1] = (y - cy)*(Z/f)
+    x,y = np.meshgrid(np.arange(1920), np.arange(1080))
+    assert depth.shape == (1080, 1920)
+    XYZ = np.empty((1080,1920,3))
+    Z = depth / 1000. # convert mm -> meters
+    Y = (y - cy)*(Z/f)
+    X = (x - cx)*(Z/f)
+    # the kinect2 original frame is different from the kinect2 frame calibrated by h2r package
+    XYZ[:,:,0] = Z
+    XYZ[:,:,1] = -X
+    XYZ[:,:,2] = -Y
+#    Z = XYZ[:,:,2] = depth / 1000. # convert mm -> meters
+#    XYZ[:,:,0] = (x - cx)*(Z/f)
+#    XYZ[:,:,1] = (y - cy)*(Z/f)
 
     return XYZ
     

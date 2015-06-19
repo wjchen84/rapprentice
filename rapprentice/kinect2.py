@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 __author__ = 'chin'
 
+DEBUGPLOT = False
+
 import rospy
 from sensor_msgs.msg import Image, PointCloud2
 from cv_bridge import CvBridge, CvBridgeError
@@ -21,14 +23,14 @@ class Kinect2():
         self.cv_depth_img = None
 
         self.rgb_sub = rospy.Subscriber(    # Creating a subscriber listening to the kinect2 image topic
-            "/kinect2/rgb_rect/image",      # The topic to which it should listen to
+            "/kinect2/hd/image_color_rect", # The topic to which it should listen to
             Image,                          # The data type of the topic
             callback=self.rgb_callback,     # The callback function that is triggered when a new message arrives
             queue_size=1                    # Disregard every message but the latest
         )
 
         self.depth_sub = rospy.Subscriber(  # Creating a subscriber listening to the kinect2 image topic
-            "/kinect2/depth_highres/image",    # The topic to which it should listen to
+            "/kinect2/hd/image_depth_rect", # The topic to which it should listen to
             Image,                          # The data type of the topic
             callback=self.depth_callback,   # The callback function that is triggered when a new message arrives
             queue_size=1                    # Disregard every message but the latest
@@ -36,9 +38,9 @@ class Kinect2():
 
     """
         self.pcl_sub = rospy.Subscriber(    # Creating a subscriber listening to the kinect2 image topic
-            "/kinect2/depth_highres/points",    # The topic to which it should listen to
-            PointCloud2,                          # The data type of the topic
-            callback=self.pcl_callback,   # The callback function that is triggered when a new message arrives
+            "/kinect2/hd/points",           # The topic to which it should listen to
+            PointCloud2,                    # The data type of the topic
+            callback=self.pcl_callback,     # The callback function that is triggered when a new message arrives
             queue_size=1                    # Disregard every message but the latest
         )
 
@@ -64,11 +66,11 @@ class Kinect2():
         except CvBridgeError, e:
             print e
 
-        """
-        cv2.imshow("RGB image", self.cv_rgb_img)              # Showing the RGB image
-        cv2.imshow("Depth image", self.cv_depth_img)          # Showing the depth image
-        cv2.waitKey(1)
-        """
+        if DEBUGPLOT:
+            cv2.imshow("RGB image", self.cv_rgb_img)              # Showing the RGB image
+            cv2.imshow("Depth image", self.cv_depth_img)          # Showing the depth image
+            cv2.waitKey(1)
+
         """
         # Convert the depth image to a Numpy array since most cv2 functions require Numpy arrays
         depth_array = np.array(depth_img, dtype=np.float16)
@@ -98,6 +100,6 @@ class Kinect2():
 # The block below will be executed when the python file is executed
 # __name__ and __main__ are built-in python variables and need to start and end with *two* underscores
 if __name__ == '__main__':
-    rospy.init_node("k2img")        # Create a node of name k2img
+    rospy.init_node("k2rgbd")        # Create a node of name k2img
     k2 = Kinect2(rospy.get_name)    # Create an instance of above class
     rospy.spin()                    # Function to keep the node running until terminated via Ctrl+C

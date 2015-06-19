@@ -1,13 +1,19 @@
 #!/usr/bin/env python
 
+DEBUGPLOT = False
+
 import argparse
 usage="""
 
 Run in simulation with a translation and a rotation of fake data:
+./do_task.py ../sampledata/overhand/overhand.h5 --fake_data_segment=overhand0_seg00 --execution=0  --animation=1 --fake_data_transform .1 .1 .1 .1 .1 .1
 ./do_task.py ~/Data/sampledata/overhand/overhand.h5 --fake_data_segment=overhand0_seg00 --execution=0  --animation=1 --select_manual --fake_data_transform .1 .1 .1 .1 .1 .1
 
 Run in simulation choosing the closest demo, single threaded
 ./do_task.py ~/Data/all.h5 --fake_data_segment=demo1-seg00 --execution=0  --animation=1  --parallel=0
+
+Run in simulation but with actual kinect 2 sensor readings
+./do_task.py ../sampledata/overhand/overhand.h5 --execution=0  --animation=1
 
 Actually run on the robot without pausing or animating
 ./do_task.py ~/Data/overhand2/all.h5 --execution=1 --animation=0
@@ -15,7 +21,7 @@ Actually run on the robot without pausing or animating
 """
 parser = argparse.ArgumentParser(usage=usage)
 parser.add_argument("h5file", type=str)
-parser.add_argument("--cloud_proc_func", default="extract_red")
+parser.add_argument("--cloud_proc_func", default="extract_blue")
 parser.add_argument("--cloud_proc_mod", default="rapprentice.cloud_proc_funcs")
 
 parser.add_argument("--execution", type=int, default=0)
@@ -35,7 +41,7 @@ parser.add_argument("--interactive",action="store_true")
 
 args = parser.parse_args()
 
-if args.fake_data_segment is None: assert args.execution==1
+#if args.fake_data_segment is None: assert args.execution==1
 
 ###################
 
@@ -64,6 +70,13 @@ from rapprentice import registration, colorize, berkeley_pr2, \
      planning, tps, func_utils, resampling, clouds
 from rapprentice import math_utils as mu
 from rapprentice.yes_or_no import yes_or_no
+
+try:
+    from rapprentice import kinect2
+    import rospy
+    from baxter_example import ik_service_client_dual as baxter_ik
+except ImportError:
+    print "Couldn't import ros stuff"
 
 """
 try:
@@ -254,6 +267,7 @@ class Globals:
     env = None
 
     pr2 = None
+    k2 = None
 
 def main():
 
@@ -282,8 +296,22 @@ def main():
         Globals.robot = Globals.env.GetRobots()[0]
 
     if not args.fake_data_segment:
+        rospy.init_node("k2rgbd")        # Create a node of name k2img
+        Globals.k2 = kinect2.Kinect2(rospy.get_name)
+        import time
+        time.sleep(2)
+        if DEBUGPLOT:
+            import cv2, time
+            time.sleep(1)
+            print Globals.k2.cv_depth_img
+            cv2.imshow("Depth image", Globals.k2.cv_depth_img)          # Showing the depth image
+            cv2.imshow("RGB image", Globals.k2.cv_rgb_img)              # Showing the RGB image
+            cv2.waitKey(10000)
+            cv2.destroyAllWindows()
+        """
         grabber = cloudprocpy.CloudGrabber()
         grabber.startRGBD()
+        """
 
     Globals.viewer = trajoptpy.GetViewer(Globals.env)
 
@@ -302,6 +330,12 @@ def main():
             r2r = ros2rave.RosToRave(Globals.robot, asarray(fake_seg["joint_states"]["name"]))
             r2r.set_values(Globals.robot, asarray(fake_seg["joint_states"]["position"][0]))
         else:
+            rgb = Globals.k2.cv_rgb_img
+            depth = Globals.k2.cv_depth_img
+            T_w_k = berkeley_pr2.get_kinect_transform()
+            #T_w_k = berkeley_pr2.get_kinect_transform(Globals.robot)
+            new_xyz = cloud_proc_func(rgb, depth, T_w_k)
+
             """
             Globals.pr2.head.set_pan_tilt(0,1.2)
             Globals.pr2.rarm.goto_posture('side')
@@ -340,6 +374,11 @@ def main():
             redprint("DONE!")
             break
 
+        """
+        if not(args.fake_data_segment) and not(args.execution):
+            r2r = ros2rave.RosToRave(Globals.robot, asarray(seg_info["joint_states"]["name"]))
+            r2r.set_values(Globals.robot, asarray(seg_info["joint_states"]["position"][0]))
+        """
 
         if args.log:
             with open(osp.join(LOG_DIR,"neighbor%i.txt"%LOG_COUNT),"w") as fh: fh.write(seg_name)
@@ -411,6 +450,8 @@ def main():
                 ee_link_name = "%s_gripper_tool_frame"%lr
                 new_ee_traj = link2eetraj[ee_link_name][i_start:i_end+1]
                 new_ee_traj_rs = resampling.interp_hmats(timesteps_rs, np.arange(len(new_ee_traj)), new_ee_traj)
+                print new_ee_traj_rs
+                return
                 """
                 if args.execution: Globals.pr2.update_rave()
                 """
