@@ -4,62 +4,40 @@ import cv2, numpy as np
 import skimage.morphology as skim
 DEBUG_PLOTS=True
 
-def extract_blue(rgb, depth, T_w_k):
+def extract_black(rgb, depth, T_w_k):
     """
-    extract red points and downsample
+    extract black points and downsample
     """
 
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_BGR2HSV)
-
-    # define range of blue color in HSV
-#    lower_blue = np.array([50,30,30])
-    lower_blue = np.array([110,50,50])
-    upper_blue = np.array([130,255,255])
-
-    # Threshold the HSV image to get only blue colors
-    #blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-    h = hsv[:,:,0]
-    s = hsv[:,:,1]
-    v = hsv[:,:,2]
-
-#    h_mask = (h > lower_blue[0]) & (h < upper_blue[0])
-#    s_mask = (s > lower_blue[1]) & (s < upper_blue[1])
-#    v_mask = (v > lower_blue[2]) & (v < upper_blue[2])
-#    h_mask = (h >0)
-#    s_mask = (s > 40)
-#    v_mask = (v < 30)
-#    blue_mask = h_mask & s_mask & v_mask
     b = rgb[:, :, 0]
     g = rgb[:, :, 1]
     r = rgb[:, :, 2]
-    b_mask = (b < 40)
-    g_mask = (g < 40)
-    r_mask = (r < 40)
-    blue_mask = b_mask & g_mask & r_mask
+    b_mask = (b < 100)
+    g_mask = (g < 100)
+    r_mask = (r < 100)
+    black_mask = b_mask | g_mask | r_mask
 
-    valid_mask = (depth > 500) & (depth < 1050)
+    depth_mask = (depth > 600) & (depth < 1300)
 
     xyz_k = clouds.depth_to_xyz(depth, berkeley_pr2.f)
     xyz_w = xyz_k.dot(T_w_k[:3,:3].T) + T_w_k[:3,3][None,None,:]
 
-#    x,y = np.meshgrid(np.arange(1920), np.arange(1080))
-#    region_mask = (x > 700) & (x < 1220) & (y < 750) & (y > 330)
-    region_mask = (xyz_w[:,:,0] > 0.6) & (xyz_w[:,:,0] < 0.9) & (xyz_w[:,:,1] > -0.2) & (xyz_w[:,:,1] < 0.2)
+    x,y = np.meshgrid(np.arange(1920), np.arange(1080))
+    region_mask = (y > 100) & (y < 1000) & (xyz_w[:,:,0] > 0.5) & (xyz_w[:,:,0] < 1) & (xyz_w[:,:,1] > -0.28) & (xyz_w[:,:,1] < 0.28)
 
     z = xyz_w[:,:,2]
     z0 = xyz_k[:,:,2]
 
     height_mask = (xyz_w[:,:,2] > -0.3) & (xyz_w[:,:,2] < 0) # TODO pass in parameter
 
-#    good_mask = blue_mask & valid_mask
-    good_mask = blue_mask & height_mask & valid_mask & region_mask
-    good_mask = skim.remove_small_objects(good_mask,min_size=5)
+    good_mask = black_mask & height_mask & depth_mask & region_mask
+    good_mask = skim.remove_small_objects(good_mask,min_size=2)
 
     if DEBUG_PLOTS:
         cv2.imshow("z0",z0/z0.max())
         cv2.imshow("z",z/z.max())
-        cv2.imshow("black", blue_mask.astype('uint8')*255)
-        cv2.imshow("depth", valid_mask.astype('uint8')*255)
+        cv2.imshow("black", black_mask.astype('uint8')*255)
+        cv2.imshow("depth", depth_mask.astype('uint8')*255)
         cv2.imshow("height", height_mask.astype('uint8')*255)
         cv2.imshow("region", region_mask.astype('uint8')*255)
         cv2.imshow("final", good_mask.astype('uint8')*255)

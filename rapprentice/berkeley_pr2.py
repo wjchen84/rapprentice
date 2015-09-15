@@ -6,6 +6,7 @@ put Berkeley-specific parameters here
 
 import numpy as np
 import math
+from rapprentice import transformations
 
 
 """
@@ -28,7 +29,6 @@ T_h_k = np.array([[-0.02102462, -0.03347223,  0.99921848, -0.186996  ],
  [ 0.,          0.,          0.,          1.        ]])
 
 f = 544.260779961
-"""
 
 T_h_k = np.array([[-0.02102462, -0.03347223,  0.99921848, 0.2  ],
  [-0.99974787, -0.00717795, -0.02127621,  0.04361884],
@@ -38,11 +38,14 @@ T_h_k = np.array([[-0.02102462, -0.03347223,  0.99921848, 0.2  ],
 T_tmp = np.array([[1, 0, 0, 0], [0, 0.5, 0.8667, 0], [0, -0.8667, 0.5, 0], [0, 0, 0, 1]])
 
 T_h_k = T_h_k.dot(T_tmp)
+"""
 
 f = 1081.37
 
-trans = np.array([1.144, -0.349, 0.458])
-quat = np.array([-0.310, 0.105, 0.886, 0.328]) # (qx, qy, qz, qw)
+trans = np.array([1.160, -0.590, 0.505]) #([1.160, -0.620, 0.500])
+quat = np.array([-0.2348969 ,  0.15495554,  0.86150072,  0.42264494]) # (qx, qy, qz, qw)
+#quat = np.array([-0.245, 0.133, 0.865, 0.417]) # (qx, qy, qz, qw)
+#quat = np.array([-0.266, 0.090, 0.871, 0.404]) # (qx, qy, qz, qw)
 
 def quaternion_to_R(quat, matrix):
     """Convert a quaternion into rotation matrix form.
@@ -96,12 +99,16 @@ def quaternion_to_R(quat, matrix):
     """
 
 def get_kinect_transform():
+    """
     matrix = {}
     quaternion_to_R(quat, matrix)
     T_w_k = np.array([[matrix[0,0], matrix[0,1], matrix[0,2], trans[0]],
                       [matrix[1,0], matrix[1,1], matrix[1,2], trans[1]],
                       [matrix[2,0], matrix[2,1], matrix[2,2], trans[2]],
                       [0, 0, 0, 1]])
+    """
+    T_w_k = transformations.quaternion_matrix(quat)
+    T_w_k[:3,3] += trans
     return T_w_k
 
     """

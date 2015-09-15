@@ -12,21 +12,29 @@ Run in simulation with a translation and a rotation of fake data:
 Run in simulation choosing the closest demo, single threaded
 ./do_task.py ~/Data/all.h5 --fake_data_segment=demo1-seg00 --execution=0  --animation=1  --parallel=0
 
+For Calibration
+./do_task.py ../data/sampledata/overhand/overhand.h5 --calibration=1
+
 Run in simulation but with actual kinect 2 sensor readings
-./do_task.py ../sampledata/overhand/overhand.h5 --execution=0  --animation=1
+# for baxter
+./do_task.py ../data/sampledata/overhand/overhand.h5 --execution=1  --animation=1
+./do_task.py ../data/sampledata/overhand/overhand.h5 --execution=1  --animation=1  --select_manual
+# for PR2
+./do_task.py ../data/sampledata/overhand/overhand.h5 --execution=0  --animation=1  --fake_data_transform 0 0 1 0 0 0
 
 Actually run on the robot without pausing or animating
-./do_task.py ~/Data/overhand2/all.h5 --execution=1 --animation=0
+./do_task.py ../data/sampledata/overhand/overhand.h5 --execution=1 --animation=0
 
 """
 parser = argparse.ArgumentParser(usage=usage)
 parser.add_argument("h5file", type=str)
-parser.add_argument("--cloud_proc_func", default="extract_blue")
+parser.add_argument("--cloud_proc_func", default="extract_black")
 parser.add_argument("--cloud_proc_mod", default="rapprentice.cloud_proc_funcs")
 
 parser.add_argument("--execution", type=int, default=0)
 parser.add_argument("--animation", type=int, default=0)
 parser.add_argument("--parallel", type=int, default=1)
+parser.add_argument("--calibration", type=int, default=0)
 
 parser.add_argument("--prompt", action="store_true")
 parser.add_argument("--show_neighbors", action="store_true")
@@ -67,14 +75,24 @@ If you're using fake data, don't update it.
 
 from rapprentice import registration, colorize, berkeley_pr2, \
      animate_traj, ros2rave, plotting_openrave, task_execution, \
-     planning, tps, func_utils, resampling, clouds
+     planning, tps, func_utils, resampling, clouds, transformations
 from rapprentice import math_utils as mu
 from rapprentice.yes_or_no import yes_or_no
+from geometry_msgs.msg import (
+    PoseStamped,
+    Pose,
+    Point,
+    Quaternion,
+)
+from std_msgs.msg import Header
+import copy
+from rapprentice import ik_service_client_dual as baxter_ik
+import baxter_interface
+from baxter_interface import CHECK_VERSION
 
 try:
     from rapprentice import kinect2
     import rospy
-    from baxter_example import ik_service_client_dual as baxter_ik
 except ImportError:
     print "Couldn't import ros stuff"
 
@@ -90,6 +108,7 @@ import cloudprocpy, trajoptpy, openravepy
 import os, numpy as np, h5py, time
 from numpy import asarray
 import importlib
+import math
 
 cloud_proc_mod = importlib.import_module(args.cloud_proc_mod)
 cloud_proc_func = getattr(cloud_proc_mod, args.cloud_proc_func)
@@ -132,6 +151,11 @@ def binarize_gripper(angle):
 
 def set_gripper_maybesim(lr, value):
     if args.execution:
+        if not value:   # value == 0, close gripper
+            Globals.gripper[lr].close()
+        else:
+            Globals.gripper[lr].open()
+
         """
         gripper = {"l":Globals.pr2.lgrip, "r":Globals.pr2.rgrip}[lr]
         gripper.set_angle(value)
@@ -141,7 +165,8 @@ def set_gripper_maybesim(lr, value):
         Globals.robot.SetDOFValues([value*5], [Globals.robot.GetJoint("%s_gripper_l_finger_joint"%lr).GetDOFIndex()])
     return True
 
-def exec_traj_maybesim(bodypart2traj):
+
+def exec_traj_maybesim(bodypart2traj, tcp_traj, tcp_poses):
     if args.animation:
         dof_inds = []
         trajs = []
@@ -151,14 +176,34 @@ def exec_traj_maybesim(bodypart2traj):
             trajs.append(traj)
         full_traj = np.concatenate(trajs, axis=1)
         Globals.robot.SetActiveDOFs(dof_inds)
-        animate_traj.animate_traj(full_traj, Globals.robot, restore=False,pause=True)
+        animate_traj.animate_traj(full_traj, Globals.robot, restore=False, pause=True)
     if args.execution:
-        """
-        if not args.prompt or yes_or_no("execute?"):
-            pr2_trajectories.follow_body_traj(Globals.pr2, bodypart2traj)
+        # if not args.prompt or yes_or_no("execute?"):
+        if yes_or_no("Do you want to execute on the real robot?"):
+            steps = {'l': 0, 'r': 0}
+            step_inc = 3
+            for (lr, trajs) in tcp_traj.items():
+                steps[lr] = len(tcp_traj[lr])
+            step_range = range(0, max(steps['l'], steps['r']), step_inc)
+            if step_range[-1] < max(steps['l'], steps['r'])-1:
+                step_range.append(max(steps['l'], steps['r'])-1)
+            for ii in step_range:
+                if ii < steps['l']:
+                    tcp_poses['l'].position = Point(x=tcp_traj['l'][ii][0, 3], y=tcp_traj['l'][ii][1, 3], z=tcp_traj['l'][ii][2, 3])
+                    tmp_euler = transformations.euler_from_matrix(tcp_traj['l'][ii], 'syzx')
+                    # add orientation offset from PR2 to Baxter
+                    tmp_quat = transformations.quaternion_from_euler(tmp_euler[0] + math.pi/2, tmp_euler[1], tmp_euler[2], 'syzx')
+                    tcp_poses['l'].orientation = Quaternion(x=tmp_quat[0], y=tmp_quat[1], z=tmp_quat[2], w=tmp_quat[3])
+                if ii < steps['r']:
+                    tcp_poses['r'].position = Point(x=tcp_traj['r'][ii][0, 3], y=tcp_traj['r'][ii][1, 3], z=tcp_traj['r'][ii][2, 3])
+                    tmp_euler = transformations.euler_from_matrix(tcp_traj['r'][ii], 'syzx')
+                    # add orientation offset from PR2 to Baxter
+                    tmp_quat = transformations.quaternion_from_euler(tmp_euler[0] + math.pi/2, tmp_euler[1], tmp_euler[2], 'syzx')
+                    tcp_poses['r'].orientation = Quaternion(x=tmp_quat[0], y=tmp_quat[1], z=tmp_quat[2], w=tmp_quat[3])
+                baxter_move(tcp_poses)
+            # pr2_trajectories.follow_body_traj(Globals.pr2, bodypart2traj)
         else:
             return False
-        """
 
     return True
 
@@ -259,19 +304,51 @@ def unif_resample(traj, max_diff, wt = None):
     return traj_rs, newt
 
 
+
+def baxter_move(tcp_poses_cmd):
+    hdr = Header(stamp=rospy.Time.now(), frame_id='base')
+    poses = {
+        'left': PoseStamped(
+            header=hdr,
+            pose=tcp_poses_cmd['l'],
+        ),
+        'right': PoseStamped(
+            header=hdr,
+            pose=tcp_poses_cmd['r'],
+        ),
+    }
+
+    baxter_ik.ik_run(poses)
+    return poses
+
+
+"""
+def list_addvalue(oldlist, addvalue):
+    oldlist_array = np.array(oldlist)
+    oldlist_array += addvalue
+    newlist = oldlist_array.tolist()
+    return newlist
+"""
+
 ###################
 
 
 class Globals:
     robot = None
     env = None
-
     pr2 = None
     k2 = None
+    gripper = {'l': None, 'r': None}
+    arm = {'l': None, 'r': None}
 
 def main():
 
     demofile = h5py.File(args.h5file, 'r')
+    tcp_poses = {'l': Pose(), 'r': Pose()}
+    tcp_poses0 = {'l': Pose(position=Point(x=0.500, y=0.450, z=0.250), orientation=Quaternion(x=1, y=0, z=0, w=0)),
+                  'r': Pose(position=Point(x=0.500, y=-0.450, z=0.250), orientation=Quaternion(x=1, y=0, z=0, w=0))}
+    baxter2pr2offset = np.zeros((4, 4))
+    baxter2pr2offset[:3, 3] += (0, 0, 1)
 
     trajoptpy.SetInteractive(args.interactive)
 
@@ -282,28 +359,45 @@ def main():
         LOG_COUNT = 0
 
 
-    if args.execution:
+    rospy.init_node("softproj_rapp")    # Create a node of name rapp_k2
+
+    if args.execution:                  # Use actual robot (Baxter)
+        for lr in 'lr':
+            manip_name = {"l":"left", "r":"right"}[lr]
+            Globals.gripper[lr] = baxter_interface.Gripper(manip_name, CHECK_VERSION)
+            Globals.gripper[lr].calibrate()
+            Globals.gripper[lr].open()
+            Globals.gripper[lr].set_holding_force(20)  # 20% force of 30N
+
+            Globals.arm[lr] = baxter_interface.Limb(manip_name)
+            # current_f = Globals.gripper[lr].parameters()['holding_force']
+            # Globals.arm[lr].move_to_neutral()
+            # tcp_poses[lr].position = Globals.arm[lr].endpoint_pose()["position"]  #Point(x=0.500, y=0.450, z=0.250)
+            # tcp_poses[lr].orientation = Globals.arm[lr].endpoint_pose()["orientation"] #Quaternion(x=1, y=0, z=0, w=0)
+
+        tcp_poses = copy.deepcopy(tcp_poses0)
+        baxter_move(tcp_poses)
+
         """
         rospy.init_node("exec_task",disable_signals=True)
         Globals.pr2 = PR2.PR2()
         Globals.env = Globals.pr2.env
         Globals.robot = Globals.pr2.robot
         """
-    else:
+
+    if args.animation or not args.execution:
         Globals.env = openravepy.Environment()
         Globals.env.StopSimulation()
         Globals.env.Load("robots/pr2-beta-static.zae")
         Globals.robot = Globals.env.GetRobots()[0]
 
-    if not args.fake_data_segment:
-        rospy.init_node("k2rgbd")        # Create a node of name k2img
+    if not args.fake_data_segment:      # Use Kinect 2
         Globals.k2 = kinect2.Kinect2(rospy.get_name)
         import time
-        time.sleep(2)
+        time.sleep(5)
         if DEBUGPLOT:
-            import cv2, time
+            import cv2
             time.sleep(1)
-            print Globals.k2.cv_depth_img
             cv2.imshow("Depth image", Globals.k2.cv_depth_img)          # Showing the depth image
             cv2.imshow("RGB image", Globals.k2.cv_rgb_img)              # Showing the RGB image
             cv2.waitKey(10000)
@@ -336,13 +430,26 @@ def main():
             #T_w_k = berkeley_pr2.get_kinect_transform(Globals.robot)
             new_xyz = cloud_proc_func(rgb, depth, T_w_k)
 
+            if args.calibration:
+                tcp_poses = copy.deepcopy(tcp_poses0)
+                tcp_poses['r'].position = Point(x=new_xyz[-1][0], y=new_xyz[-1][1], z=new_xyz[-1][2]+0.05)
+                baxter_move(tcp_poses)
+                tcp_poses['r'].position = Point(x=new_xyz[-1][0], y=new_xyz[-1][1], z=new_xyz[-1][2])
+                baxter_move(tcp_poses)
+                raw_input("Press ENTER to continue...")
+                tcp_poses = copy.deepcopy(tcp_poses0)
+                baxter_move(tcp_poses)
+                return
+
+            # In case there is offset for mis-calibration and from baxter to PR2
+            new_xyz = new_xyz + args.fake_data_transform[0:3] + baxter2pr2offset[:3, 3]
+
             """
             Globals.pr2.head.set_pan_tilt(0,1.2)
             Globals.pr2.rarm.goto_posture('side')
             Globals.pr2.larm.goto_posture('side')
             Globals.pr2.join_all()
             time.sleep(.5)
-
 
             Globals.pr2.update_rave()
 
@@ -370,15 +477,16 @@ def main():
 
         seg_info = demofile[seg_name]
         redprint("closest demo: %s"%(seg_name))
+        if not yes_or_no("Confirm the closest demo. Do you want to continue?"):
+            return
+
         if "done" in seg_name:
             redprint("DONE!")
             break
 
-        """
         if not(args.fake_data_segment) and not(args.execution):
             r2r = ros2rave.RosToRave(Globals.robot, asarray(seg_info["joint_states"]["name"]))
             r2r.set_values(Globals.robot, asarray(seg_info["joint_states"]["position"][0]))
-        """
 
         if args.log:
             with open(osp.join(LOG_DIR,"neighbor%i.txt"%LOG_COUNT),"w") as fh: fh.write(seg_name)
@@ -388,9 +496,8 @@ def main():
 
         handles = []
         old_xyz = np.squeeze(seg_info["cloud_xyz"])
-        handles.append(Globals.env.plot3(old_xyz,5, (1,0,0)))
-        handles.append(Globals.env.plot3(new_xyz,5, (0,0,1)))
-
+        handles.append(Globals.env.plot3(old_xyz, 5, (1, 0, 0)))
+        handles.append(Globals.env.plot3(new_xyz, 5, (0, 0, 1)))
 
         scaled_old_xyz, src_params = registration.unit_boxify(old_xyz)
         scaled_new_xyz, targ_params = registration.unit_boxify(new_xyz)
@@ -423,7 +530,6 @@ def main():
             redprint("Generating joint trajectory for segment %s, part %i"%(seg_name, i_miniseg))
 
 
-
             # figure out how we're gonna resample stuff
             lr2oldtraj = {}
             for lr in 'lr':
@@ -441,6 +547,7 @@ def main():
 
             ### Generate fullbody traj
             bodypart2traj = {}
+            tcp_traj = {}
             for (lr,old_joint_traj) in lr2oldtraj.items():
 
                 manip_name = {"l":"leftarm", "r":"rightarm"}[lr]
@@ -450,16 +557,15 @@ def main():
                 ee_link_name = "%s_gripper_tool_frame"%lr
                 new_ee_traj = link2eetraj[ee_link_name][i_start:i_end+1]
                 new_ee_traj_rs = resampling.interp_hmats(timesteps_rs, np.arange(len(new_ee_traj)), new_ee_traj)
-                print new_ee_traj_rs
-                return
-                """
-                if args.execution: Globals.pr2.update_rave()
-                """
+
+                tcp_traj[lr] = new_ee_traj_rs - baxter2pr2offset
+
+                # if args.execution: Globals.pr2.update_rave()
+
                 new_joint_traj = planning.plan_follow_traj(Globals.robot, manip_name,
-                 Globals.robot.GetLink(ee_link_name), new_ee_traj_rs,old_joint_traj_rs)
+                                                           Globals.robot.GetLink(ee_link_name), new_ee_traj_rs, old_joint_traj_rs)
                 part_name = {"l":"larm", "r":"rarm"}[lr]
                 bodypart2traj[part_name] = new_joint_traj
-
 
 
             ################################
@@ -469,18 +575,22 @@ def main():
                 success &= set_gripper_maybesim(lr, binarize_gripper(seg_info["%s_gripper_joint"%lr][i_start]))
                 # Doesn't actually check if grab occurred, unfortunately
 
-
             if not success: break
 
             if len(bodypart2traj) > 0:
-                success &= exec_traj_maybesim(bodypart2traj)
+                success &= exec_traj_maybesim(bodypart2traj, tcp_traj, tcp_poses)
 
             if not success: break
-
 
 
         redprint("Segment %s result: %s"%(seg_name, success))
 
+        # move back to initial position
+        tcp_poses = copy.deepcopy(tcp_poses0)
+        baxter_move(tcp_poses)
+
+        if not yes_or_no("Do you want to continue?"):
+            return
 
         if args.fake_data_segment: break
 

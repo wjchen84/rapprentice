@@ -11,7 +11,7 @@ import numpy as np
 
 class Kinect2():
 
-    def __init__(self, name):
+    def __init__(self, name, savefig=False, figpath=""):
         """
         Function to initiate the class. Called when creating a new instance.
         :param name: the name of the ros node
@@ -21,6 +21,11 @@ class Kinect2():
         self.bridge = CvBridge()        # Creating an OpenCV bridge object to convert an OpenCV image from the ROS image
         self.cv_rgb_img = None
         self.cv_depth_img = None
+        self.frame_id = 0
+        self.save_fig = savefig
+        self.fig_path = figpath
+        if self.save_fig:
+            self.stamps_fh = open(self.fig_path + "stamps.txt", "w")
 
         self.rgb_sub = rospy.Subscriber(    # Creating a subscriber listening to the kinect2 image topic
             "/kinect2/hd/image_color_rect", # The topic to which it should listen to
@@ -51,18 +56,26 @@ class Kinect2():
     """
 
     def rgb_callback(self, img):
-        rospy.loginfo("Received RGB image of size: %i x %i" % (img.width, img.height))  # Make sure we receive something
+        if DEBUGPLOT:
+            rospy.loginfo("Received RGB image of size: %i x %i" % (img.width, img.height))  # Make sure we receive something
 
         try:
             self.cv_rgb_img = self.bridge.imgmsg_to_cv2(img, "bgr8")   # Convert to OpenCV image
+            if self.save_fig:
+                cv2.imwrite(self.fig_path + "rgb%i.jpg"%self.frame_id, self.cv_rgb_img)
         except CvBridgeError, e:
             print e
 
     def depth_callback(self, img):
-        rospy.loginfo("Received Depth image of size: %i x %i" % (img.width, img.height))   # Make sure we receive something
+        if DEBUGPLOT:
+            rospy.loginfo("Received Depth image of size: %i x %i" % (img.width, img.height))   # Make sure we receive something
 
         try:
             self.cv_depth_img = self.bridge.imgmsg_to_cv2(img)   # Convert to OpenCV image
+            if self.save_fig:
+                cv2.imwrite(self.fig_path + "depth%i.png"%self.frame_id, self.cv_depth_img)
+                self.frame_id = self.frame_id + 1
+                self.stamps_fh.write("%f\n" % rospy.get_time())
         except CvBridgeError, e:
             print e
 
@@ -101,5 +114,5 @@ class Kinect2():
 # __name__ and __main__ are built-in python variables and need to start and end with *two* underscores
 if __name__ == '__main__':
     rospy.init_node("k2rgbd")        # Create a node of name k2img
-    k2 = Kinect2(rospy.get_name)    # Create an instance of above class
+    k2 = Kinect2(rospy.get_name, False, "../data/test/")    # Create an instance of above class
     rospy.spin()                    # Function to keep the node running until terminated via Ctrl+C
