@@ -45,7 +45,7 @@ def draw_img(img, colormap = None, min_size = 1):
     cv2.destroyWindow("draw_img")
 
 
-def tile_images(imgs, nrows, ncols, row_titles = None, col_titles = None, max_width = 1000):
+def tile_images(imgs, nrows, ncols, row_titles = None, col_titles = None, max_width = 2000):
     assert nrows*ncols >= len(imgs)
     if nrows*ncols > len(imgs):
         imgs = [img for img in imgs]

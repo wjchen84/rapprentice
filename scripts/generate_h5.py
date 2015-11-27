@@ -4,6 +4,10 @@
 Generate hdf5 file based on a yaml task file that specifies bag files and annotation files
 """
 
+usage = """
+./generate_h5.py ../data/overhand_redcable/overhand.yaml
+"""
+
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("task_file")
@@ -14,15 +18,16 @@ parser.add_argument("--no_clouds")
 parser.add_argument("--clouds_only", action="store_true")
 args = parser.parse_args()
 
-
-
 import os, os.path as osp
 import rosbag
 import h5py
-from rapprentice import bag_proc
 import yaml
 import importlib, inspect
 import numpy as np
+import rospy
+from rapprentice import bag_proc
+
+rospy.init_node("generate_h5")
 
 cloud_proc_mod = importlib.import_module(args.cloud_proc_mod)
 cloud_proc_func = getattr(cloud_proc_mod, args.cloud_proc_func)
@@ -55,7 +60,7 @@ else:
         with open(ann_file, "r") as fh: annotations = yaml.load(fh)
     
         bag_proc.add_bag_to_hdf(bag, annotations, hdf, demo_name)
-        bag_proc.add_rgbd_to_hdf(osp.join(task_dir, video_dir), annotations, hdf, demo_name)
+        bag_proc.add_rgbd_to_hdf(osp.join(task_dir, video_dir), annotations, hdf, demo_name, bag)
     
     
 

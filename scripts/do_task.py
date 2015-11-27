@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 DEBUGPLOT = False
+MOVEIT_DEBUG = False
 
 import argparse
 usage="""
@@ -13,11 +14,13 @@ Run in simulation choosing the closest demo, single threaded
 ./do_task.py ~/Data/all.h5 --fake_data_segment=demo1-seg00 --execution=0  --animation=1  --parallel=0
 
 For Calibration
-./do_task.py ../data/sampledata/overhand/overhand.h5 --calibration=1
+./do_task.py ../data/sampledata/overhand/overhand.h5 --calibration="l"
 
 Run in simulation but with actual kinect 2 sensor readings
 # for baxter
-./do_task.py ../data/sampledata/overhand/overhand.h5 --execution=1  --animation=1
+./do_task.py ../data/overhand_redcable/overhand.h5 --execution=1
+./do_task.py ../data/overhand/overhand.h5 --execution=1  --animation=1
+./do_task.py ../data/sampledata/overhand/overhand.h5 --execution=1  --animation=1  --learn_from=pr2
 ./do_task.py ../data/sampledata/overhand/overhand.h5 --execution=1  --animation=1  --select_manual
 # for PR2
 ./do_task.py ../data/sampledata/overhand/overhand.h5 --execution=0  --animation=1  --fake_data_transform 0 0 1 0 0 0
@@ -28,16 +31,17 @@ Actually run on the robot without pausing or animating
 """
 parser = argparse.ArgumentParser(usage=usage)
 parser.add_argument("h5file", type=str)
-parser.add_argument("--cloud_proc_func", default="extract_black")
+parser.add_argument("--cloud_proc_func", default="extract_red")
 parser.add_argument("--cloud_proc_mod", default="rapprentice.cloud_proc_funcs")
 
 parser.add_argument("--execution", type=int, default=0)
 parser.add_argument("--animation", type=int, default=0)
 parser.add_argument("--parallel", type=int, default=1)
-parser.add_argument("--calibration", type=int, default=0)
+parser.add_argument("--calibration", type=str, default="0")   # 0: no calibration, l: left arm, r: right arm
+parser.add_argument("--learn_from", type=str, default="baxter")  # baxter or pr2
 
 parser.add_argument("--prompt", action="store_true")
-parser.add_argument("--show_neighbors", action="store_true")
+parser.add_argument("--show_neighbors", action="store_false")
 parser.add_argument("--select_manual", action="store_true")
 parser.add_argument("--log", action="store_true")
 
@@ -84,11 +88,14 @@ from geometry_msgs.msg import (
     Point,
     Quaternion,
 )
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 import copy
 from rapprentice import ik_service_client_dual as baxter_ik
 import baxter_interface
 from baxter_interface import CHECK_VERSION
+import moveit_commander
+import moveit_msgs.msg
+
 
 try:
     from rapprentice import kinect2
@@ -96,15 +103,8 @@ try:
 except ImportError:
     print "Couldn't import ros stuff"
 
-"""
-try:
-    from rapprentice import pr2_trajectories, PR2
-    import rospy
-except ImportError:
-    print "Couldn't import ros stuff"
-"""
 
-import cloudprocpy, trajoptpy, openravepy
+import trajoptpy, openravepy
 import os, numpy as np, h5py, time
 from numpy import asarray
 import importlib
@@ -166,7 +166,38 @@ def set_gripper_maybesim(lr, value):
     return True
 
 
-def exec_traj_maybesim(bodypart2traj, tcp_traj, tcp_poses):
+def align_to_nearest_pt(tcp_traj, new_xyz, steps, seg_info, i_start, i_end):
+    for lr in 'lr':
+        if steps[lr]:
+            need_align = False
+            critical_pt = np.zeros((4, 4))
+            if i_start > 0:  # previously open at i_start-1, now close at i_start
+                if (not seg_info["%s_gripper_joint"%lr][i_start]) and seg_info["%s_gripper_joint"%lr][i_start-1]:
+                    critical_pt = copy.deepcopy(tcp_traj[lr][0])
+                    need_align = True
+            if i_end < len(seg_info["%s_gripper_joint"%lr])-1:  # now open at i_end, then close at i_end+1
+                if seg_info["%s_gripper_joint"%lr][i_end] and (not seg_info["%s_gripper_joint"%lr][i_end+1]):
+                    critical_pt = copy.deepcopy(tcp_traj[lr][-1])
+                    need_align = True
+
+            if need_align:
+                #if lr == 'r':  # right limb has accuracy problem, with offset on tcp frame y axis
+                    #critical_pt[:3, 3] += np.dot(np.linalg.inv(critical_pt[:3, :3]), np.array([0, 0.02, 0]))
+                offset_xyz = new_xyz - critical_pt[:3, 3].transpose()
+                offset_d = np.linalg.norm(offset_xyz, 2, 1)
+                offset = offset_xyz[np.argmin(offset_d)]
+                if lr == 'r':  # right limb has accuracy problem, with offset on tcp frame y axis
+                    offset -= np.dot(np.linalg.inv(critical_pt[:3, :3]), np.array([0, 0.02, 0]))
+                if min(offset_d) < 0.05:
+                    trans_offset = np.zeros((4, 4))
+                    trans_offset[:3, 3] += offset.transpose()
+                    tcp_traj[lr] += trans_offset
+                    print "Arm", lr, "aligned to nearest cable point with offset as: ", offset*1000, min(offset_d)*1000
+
+    return tcp_traj
+
+
+def exec_traj_maybesim(bodypart2traj, tcp_traj, tcp_poses, new_xyz, seg_info, i_start, i_end):
     if args.animation:
         dof_inds = []
         trajs = []
@@ -178,12 +209,16 @@ def exec_traj_maybesim(bodypart2traj, tcp_traj, tcp_poses):
         Globals.robot.SetActiveDOFs(dof_inds)
         animate_traj.animate_traj(full_traj, Globals.robot, restore=False, pause=True)
     if args.execution:
-        # if not args.prompt or yes_or_no("execute?"):
-        if yes_or_no("Do you want to execute on the real robot?"):
+        if not args.animation or yes_or_no("Do you want to execute on the real robot?"):
             steps = {'l': 0, 'r': 0}
-            step_inc = 3
             for (lr, trajs) in tcp_traj.items():
                 steps[lr] = len(tcp_traj[lr])
+            tcp_traj = align_to_nearest_pt(tcp_traj, new_xyz, steps, seg_info, i_start, i_end)
+
+            if MOVEIT_DEBUG:
+                step_inc = max(int(max(steps['l'], steps['r'])/2), 1)
+            else:
+                step_inc = 5
             step_range = range(0, max(steps['l'], steps['r']), step_inc)
             if step_range[-1] < max(steps['l'], steps['r'])-1:
                 step_range.append(max(steps['l'], steps['r'])-1)
@@ -191,16 +226,35 @@ def exec_traj_maybesim(bodypart2traj, tcp_traj, tcp_poses):
                 if ii < steps['l']:
                     tcp_poses['l'].position = Point(x=tcp_traj['l'][ii][0, 3], y=tcp_traj['l'][ii][1, 3], z=tcp_traj['l'][ii][2, 3])
                     tmp_euler = transformations.euler_from_matrix(tcp_traj['l'][ii], 'syzx')
-                    # add orientation offset from PR2 to Baxter
-                    tmp_quat = transformations.quaternion_from_euler(tmp_euler[0] + math.pi/2, tmp_euler[1], tmp_euler[2], 'syzx')
+                    if args.learn_from == "pr2":
+                        # add orientation offset from PR2 to Baxter
+                        tmp_quat = transformations.quaternion_from_euler(tmp_euler[0] + math.pi/2, tmp_euler[1], tmp_euler[2], 'syzx')
+                    else:
+                        tmp_quat = transformations.quaternion_from_euler(tmp_euler[0], tmp_euler[1], tmp_euler[2], 'syzx')
                     tcp_poses['l'].orientation = Quaternion(x=tmp_quat[0], y=tmp_quat[1], z=tmp_quat[2], w=tmp_quat[3])
                 if ii < steps['r']:
                     tcp_poses['r'].position = Point(x=tcp_traj['r'][ii][0, 3], y=tcp_traj['r'][ii][1, 3], z=tcp_traj['r'][ii][2, 3])
                     tmp_euler = transformations.euler_from_matrix(tcp_traj['r'][ii], 'syzx')
-                    # add orientation offset from PR2 to Baxter
-                    tmp_quat = transformations.quaternion_from_euler(tmp_euler[0] + math.pi/2, tmp_euler[1], tmp_euler[2], 'syzx')
+                    if args.learn_from == "pr2":
+                        # add orientation offset from PR2 to Baxter
+                        tmp_quat = transformations.quaternion_from_euler(tmp_euler[0] + math.pi/2, tmp_euler[1], tmp_euler[2], 'syzx')
+                    else:
+                        tmp_quat = transformations.quaternion_from_euler(tmp_euler[0], tmp_euler[1], tmp_euler[2], 'syzx')
                     tcp_poses['r'].orientation = Quaternion(x=tmp_quat[0], y=tmp_quat[1], z=tmp_quat[2], w=tmp_quat[3])
-                baxter_move(tcp_poses)
+                if ii < step_range[-1]:
+                    tol_factor = 20
+                else:
+                    tol_factor = 1
+
+                limb_enable = 0
+                if steps['l']:
+                    limb_enable |= 1
+                if steps['r']:
+                    limb_enable |= 2
+                baxter_move(tcp_poses, tol_factor, limb_enable)
+
+                # print "Left: ", Globals.gripper['l'].position() < 10, "   Right: ", Globals.gripper['r'].position() < 10
+
             # pr2_trajectories.follow_body_traj(Globals.pr2, bodypart2traj)
         else:
             return False
@@ -246,14 +300,22 @@ def find_closest_auto(demofile, new_xyz):
 
     print "costs\n",costs
     if args.show_neighbors:
-        nshow = min(5, len(keys))
+        nshow = min(1, len(keys))
         import cv2, rapprentice.cv_plot_utils as cpu
         sortinds = np.argsort(costs)[:nshow]
         near_rgbs = [asarray(demofile[keys[i]]["rgb"]) for i in sortinds]
-        bigimg = cpu.tile_images(near_rgbs, 1, nshow)
-        cv2.imshow("neighbors", bigimg)
-        print "press any key to continue"
-        cv2.waitKey()
+        bigimg = cpu.tile_images(near_rgbs, 1, nshow, row_titles=None, col_titles=None, max_width=700)
+        #bigimg = cpu.tile_images(near_rgbs, 1, nshow)
+        cv2.imshow("closest demos", bigimg)
+        cv2.moveWindow("closest demos", 0, 490)
+        #cv2.moveWindow("closest demos", 0, 900)
+        cv2.waitKey(1000)
+
+        choice = raw_input("Press [y] to confirm or [0/1/2] to choose the closest demo, [n] to abort: ")
+        if choice == "n":
+            return False
+        if choice in ["0", "1", "2"]:
+            return keys[sortinds[choice]]
 
     ibest = np.argmin(costs)
     return keys[ibest]
@@ -281,7 +343,6 @@ def unif_resample(traj, max_diff, wt = None):
         wt = np.atleast_2d(wt)
         traj = traj*wt
 
-
     dl = mu.norms(traj[1:] - traj[:-1],1)
     l = np.cumsum(np.r_[0,dl])
     goodinds = np.r_[True, dl > 1e-8]
@@ -305,21 +366,126 @@ def unif_resample(traj, max_diff, wt = None):
 
 
 
-def baxter_move(tcp_poses_cmd):
-    hdr = Header(stamp=rospy.Time.now(), frame_id='base')
-    poses = {
-        'left': PoseStamped(
-            header=hdr,
-            pose=tcp_poses_cmd['l'],
-        ),
-        'right': PoseStamped(
-            header=hdr,
-            pose=tcp_poses_cmd['r'],
-        ),
-    }
+def baxter_move(tcp_poses_cmd, tol_factor=1, limb_enable=3):
+    if MOVEIT_DEBUG:
+        moveit_move_pose(tcp_poses_cmd, limb_enable)
+    else:
+        hdr = Header(stamp=rospy.Time.now(), frame_id='base')
+        poses = {
+            'left': PoseStamped(
+                header=hdr,
+                pose=tcp_poses_cmd['l'],
+            ),
+            'right': PoseStamped(
+                header=hdr,
+                pose=tcp_poses_cmd['r'],
+            ),
+        }
+        baxter_ik.ik_run(poses, tol_factor)
 
-    baxter_ik.ik_run(poses)
-    return poses
+
+def baxter_move_to_initial():
+    """
+    Command the joints to the center of their joint ranges
+
+    Neutral is defined as::
+    ['*_s0', '*_s1', '*_e0', '*_e1', '*_w0', '*_w1', '*_w2']
+    [0.0, -0.55, 0.0, 0.75, 0.0, 1.26, 0.0]
+
+    """
+    limb_jnt_angles = {}
+
+    for lr in 'lr':
+        limb_jnt_angles[lr] = dict(zip(Globals.arm[lr].joint_names(),
+                                       [0.0, -0.85, 0.0, 0.75, 0.0, 1.26, 0.0]))
+
+    if MOVEIT_DEBUG:
+        both_arm_jnt_angles = limb_jnt_angles['l'].copy()
+        both_arm_jnt_angles.update(limb_jnt_angles['r'])
+        moveit_move_joint(both_arm_jnt_angles)
+    else:
+        baxter_ik.jnt_thread_run(Globals.arm, limb_jnt_angles, 10)
+
+    import time
+    time.sleep(0.5)
+
+
+def abort_task():
+
+    if MOVEIT_DEBUG:
+        moveit_commander.roscpp_shutdown()
+    raise NameError("Task Aborted!")
+
+
+def moveit_setup():
+
+    ## First initialize moveit_commander
+    moveit_commander.roscpp_initialize('/joint_states:=/robot/joint_states')
+
+    ## Instantiate a RobotCommander object.  This object is an interface to the robot as a whole.
+    robot = moveit_commander.RobotCommander()
+
+    ## Instantiate a MoveGroupCommander object.
+    group = moveit_commander.MoveGroupCommander("both_arms")
+
+    ## We create this DisplayTrajectory publisher which is used below to publish
+    ## trajectories for RVIZ to visualize.
+    display_trajectory_publisher = rospy.Publisher(
+        '/move_group/display_planned_path',
+        moveit_msgs.msg.DisplayTrajectory)
+
+    ## We can get the name of the reference frame for this robot
+    print "============ Reference frame: %s" % group.get_planning_frame()
+
+    ## We can get a list of all the groups in the robot
+    print "============ Robot Groups:"
+    print robot.get_group_names()
+
+    group.set_goal_joint_tolerance(0.03)
+    group.set_goal_position_tolerance(0.03)
+    group.set_goal_orientation_tolerance(0.3)
+
+    Globals.moveit['robot'] = robot
+    Globals.moveit['group'] = group
+    Globals.moveit['display_trajectory_publisher'] = display_trajectory_publisher
+
+
+def moveit_move_joint(joint_cmd):
+    Globals.moveit['group'].clear_pose_targets()
+    Globals.moveit['group'].set_joint_value_target(joint_cmd)
+    plan = Globals.moveit['group'].plan()
+    moveit_display_traj_and_run(plan)
+
+
+def moveit_move_pose(tcp_poses_cmd, limb_enable=0):
+    Globals.moveit['group'].clear_pose_targets()
+
+    ## Planning to a Pose goal
+    if limb_enable & 1:
+        Globals.moveit['group'].set_pose_target(tcp_poses_cmd['l'], "left_gripper")
+    if limb_enable & 2:
+        Globals.moveit['group'].set_pose_target(tcp_poses_cmd['r'], "right_gripper")
+
+    plan = Globals.moveit['group'].plan()
+    moveit_display_traj_and_run(plan)
+
+
+def moveit_display_traj_and_run(plan):
+    print "============ Waiting while RVIZ displays the planned trajectory..."
+    if DEBUGPLOT:  # and yes_or_no("Do you want to see the trajectory again?"):
+        ## You can ask RVIZ to visualize a plan (aka trajectory) for you again
+        print "============ Visualizing the planned trajectory"
+        display_trajectory = moveit_msgs.msg.DisplayTrajectory()
+        display_trajectory.trajectory_start = Globals.moveit['robot'].get_current_state()
+        display_trajectory.trajectory.append(plan)
+        Globals.moveit['display_trajectory_publisher'].publish(display_trajectory)
+
+    if ~DEBUGPLOT or yes_or_no("Do you want to execute on the real robot?"):
+        ## Moving to a pose goal
+        Globals.moveit['group'].go(wait=True)
+    else:
+        abort_task()
+
 
 
 """
@@ -340,15 +506,14 @@ class Globals:
     k2 = None
     gripper = {'l': None, 'r': None}
     arm = {'l': None, 'r': None}
+    moveit = {'robot': None, 'group': None, 'display_trajectory_publisher': None}
 
 def main():
 
     demofile = h5py.File(args.h5file, 'r')
-    tcp_poses = {'l': Pose(), 'r': Pose()}
-    tcp_poses0 = {'l': Pose(position=Point(x=0.500, y=0.450, z=0.250), orientation=Quaternion(x=1, y=0, z=0, w=0)),
-                  'r': Pose(position=Point(x=0.500, y=-0.450, z=0.250), orientation=Quaternion(x=1, y=0, z=0, w=0))}
+    tcp_poses0 = {'l': Pose(), 'r': Pose()}
     baxter2pr2offset = np.zeros((4, 4))
-    baxter2pr2offset[:3, 3] += (0, 0, 1)
+    baxter2pr2offset[:3, 3] += (0, 0, 0.6)
 
     trajoptpy.SetInteractive(args.interactive)
 
@@ -361,22 +526,24 @@ def main():
 
     rospy.init_node("softproj_rapp")    # Create a node of name rapp_k2
 
-    if args.execution:                  # Use actual robot (Baxter)
+    if args.execution or args.calibration != "0":                  # Use actual robot (Baxter)
+        if MOVEIT_DEBUG:
+            moveit_setup()
+
         for lr in 'lr':
-            manip_name = {"l":"left", "r":"right"}[lr]
+            manip_name = {"l": "left", "r": "right"}[lr]
             Globals.gripper[lr] = baxter_interface.Gripper(manip_name, CHECK_VERSION)
-            Globals.gripper[lr].calibrate()
+            #Globals.gripper[lr].calibrate()
             Globals.gripper[lr].open()
             Globals.gripper[lr].set_holding_force(20)  # 20% force of 30N
 
             Globals.arm[lr] = baxter_interface.Limb(manip_name)
-            # current_f = Globals.gripper[lr].parameters()['holding_force']
-            # Globals.arm[lr].move_to_neutral()
-            # tcp_poses[lr].position = Globals.arm[lr].endpoint_pose()["position"]  #Point(x=0.500, y=0.450, z=0.250)
-            # tcp_poses[lr].orientation = Globals.arm[lr].endpoint_pose()["orientation"] #Quaternion(x=1, y=0, z=0, w=0)
 
+        baxter_move_to_initial()
+        for lr in 'lr':
+            tcp_poses0[lr].position = Globals.arm[lr].endpoint_pose()["position"]
+            tcp_poses0[lr].orientation = Globals.arm[lr].endpoint_pose()["orientation"]
         tcp_poses = copy.deepcopy(tcp_poses0)
-        baxter_move(tcp_poses)
 
         """
         rospy.init_node("exec_task",disable_signals=True)
@@ -390,11 +557,12 @@ def main():
         Globals.env.StopSimulation()
         Globals.env.Load("robots/pr2-beta-static.zae")
         Globals.robot = Globals.env.GetRobots()[0]
+        Globals.viewer = trajoptpy.GetViewer(Globals.env)
 
     if not args.fake_data_segment:      # Use Kinect 2
         Globals.k2 = kinect2.Kinect2(rospy.get_name)
         import time
-        time.sleep(5)
+        time.sleep(3)
         if DEBUGPLOT:
             import cv2
             time.sleep(1)
@@ -407,12 +575,9 @@ def main():
         grabber.startRGBD()
         """
 
-    Globals.viewer = trajoptpy.GetViewer(Globals.env)
-
     #####################
 
     while True:
-
 
         redprint("Acquire point cloud")
         if args.fake_data_segment:
@@ -427,18 +592,18 @@ def main():
             rgb = Globals.k2.cv_rgb_img
             depth = Globals.k2.cv_depth_img
             T_w_k = berkeley_pr2.get_kinect_transform()
-            #T_w_k = berkeley_pr2.get_kinect_transform(Globals.robot)
             new_xyz = cloud_proc_func(rgb, depth, T_w_k)
 
-            if args.calibration:
-                tcp_poses = copy.deepcopy(tcp_poses0)
-                tcp_poses['r'].position = Point(x=new_xyz[-1][0], y=new_xyz[-1][1], z=new_xyz[-1][2]+0.05)
+            if args.calibration != "0":
+                tcp_poses[args.calibration].orientation = Quaternion(x=0, y=1, z=0, w=0)
+                tcp_poses[args.calibration].position = Point(x=new_xyz[-1][0], y=new_xyz[-1][1], z=new_xyz[-1][2]+0.1)
                 baxter_move(tcp_poses)
-                tcp_poses['r'].position = Point(x=new_xyz[-1][0], y=new_xyz[-1][1], z=new_xyz[-1][2])
+                tcp_poses[args.calibration].position = Point(x=new_xyz[-1][0], y=new_xyz[-1][1], z=new_xyz[-1][2])
                 baxter_move(tcp_poses)
                 raw_input("Press ENTER to continue...")
-                tcp_poses = copy.deepcopy(tcp_poses0)
+                tcp_poses[args.calibration].position = Point(x=new_xyz[-1][0], y=new_xyz[-1][1], z=new_xyz[-1][2]+0.1)
                 baxter_move(tcp_poses)
+                baxter_move_to_initial()
                 return
 
             # In case there is offset for mis-calibration and from baxter to PR2
@@ -474,17 +639,18 @@ def main():
             seg_name = find_closest_manual(demofile, new_xyz)
         else:
             seg_name = find_closest_auto(demofile, new_xyz)
+            if seg_name is False:
+                redprint("Task Aborted!")
+                return
 
         seg_info = demofile[seg_name]
         redprint("closest demo: %s"%(seg_name))
-        if not yes_or_no("Confirm the closest demo. Do you want to continue?"):
-            return
 
         if "done" in seg_name:
             redprint("DONE!")
             break
 
-        if not(args.fake_data_segment) and not(args.execution):
+        if not args.fake_data_segment and not args.execution:
             r2r = ros2rave.RosToRave(Globals.robot, asarray(seg_info["joint_states"]["name"]))
             r2r.set_values(Globals.robot, asarray(seg_info["joint_states"]["position"][0]))
 
@@ -494,10 +660,14 @@ def main():
 
         redprint("Generating end-effector trajectory")
 
-        handles = []
-        old_xyz = np.squeeze(seg_info["cloud_xyz"])
-        handles.append(Globals.env.plot3(old_xyz, 5, (1, 0, 0)))
-        handles.append(Globals.env.plot3(new_xyz, 5, (0, 0, 1)))
+        if args.learn_from == "pr2":
+            old_xyz = np.squeeze(seg_info["cloud_xyz"])
+        else:  # add offset for animation with pr2
+            old_xyz = np.squeeze(seg_info["cloud_xyz"]) + baxter2pr2offset[:3, 3]
+        if args.animation or not args.execution:
+            handles = []
+            handles.append(Globals.env.plot3(old_xyz, 5, (1, 0, 0)))
+            handles.append(Globals.env.plot3(new_xyz, 5, (0, 0, 1)))
 
         scaled_old_xyz, src_params = registration.unit_boxify(old_xyz)
         scaled_new_xyz, targ_params = registration.unit_boxify(new_xyz)
@@ -505,17 +675,22 @@ def main():
                                        plotting=5 if args.animation else 0,rot_reg=np.r_[1e-4,1e-4,1e-1], n_iter=50, reg_init=10, reg_final=.1)
         f = registration.unscale_tps(f, src_params, targ_params)
 
-        handles.extend(plotting_openrave.draw_grid(Globals.env, f.transform_points, old_xyz.min(axis=0)-np.r_[0,0,.1], old_xyz.max(axis=0)+np.r_[0,0,.1], xres = .1, yres = .1, zres = .04))
+        if args.animation or not args.execution:
+            handles.extend(plotting_openrave.draw_grid(Globals.env, f.transform_points, old_xyz.min(axis=0)-np.r_[0,0,.1], old_xyz.max(axis=0)+np.r_[0,0,.1], xres = .1, yres = .1, zres = .04))
 
         link2eetraj = {}
         for lr in 'lr':
             link_name = "%s_gripper_tool_frame"%lr
-            old_ee_traj = asarray(seg_info[link_name]["hmat"])
+            if args.learn_from == "pr2":
+                old_ee_traj = asarray(seg_info[link_name]["hmat"])
+            else:  # add offset for animation with pr2
+                old_ee_traj = asarray(seg_info[link_name]["hmat"]) + baxter2pr2offset
             new_ee_traj = f.transform_hmats(old_ee_traj)
             link2eetraj[link_name] = new_ee_traj
 
-            handles.append(Globals.env.drawlinestrip(old_ee_traj[:,:3,3], 2, (1,0,0,1)))
-            handles.append(Globals.env.drawlinestrip(new_ee_traj[:,:3,3], 2, (0,1,0,1)))
+            if args.animation or not args.execution:
+                handles.append(Globals.env.drawlinestrip(old_ee_traj[:,:3,3], 2, (1,0,0,1)))
+                handles.append(Globals.env.drawlinestrip(new_ee_traj[:,:3,3], 2, (0,1,0,1)))
 
         miniseg_starts, miniseg_ends = split_trajectory_by_gripper(seg_info)
         success = True
@@ -528,7 +703,6 @@ def main():
 
             ################################
             redprint("Generating joint trajectory for segment %s, part %i"%(seg_name, i_miniseg))
-
 
             # figure out how we're gonna resample stuff
             lr2oldtraj = {}
@@ -543,7 +717,6 @@ def main():
                 JOINT_LENGTH_PER_STEP = .1
                 _, timesteps_rs = unif_resample(old_total_traj, JOINT_LENGTH_PER_STEP)
             ####
-
 
             ### Generate fullbody traj
             bodypart2traj = {}
@@ -562,11 +735,13 @@ def main():
 
                 # if args.execution: Globals.pr2.update_rave()
 
-                new_joint_traj = planning.plan_follow_traj(Globals.robot, manip_name,
-                                                           Globals.robot.GetLink(ee_link_name), new_ee_traj_rs, old_joint_traj_rs)
+                if args.animation or not args.execution:
+                    new_joint_traj = planning.plan_follow_traj(Globals.robot, manip_name,
+                                                               Globals.robot.GetLink(ee_link_name), new_ee_traj_rs, old_joint_traj_rs)
+                else:
+                    new_joint_traj = old_joint_traj_rs
                 part_name = {"l":"larm", "r":"rarm"}[lr]
                 bodypart2traj[part_name] = new_joint_traj
-
 
             ################################
             redprint("Executing joint trajectory for segment %s, part %i using arms '%s'"%(seg_name, i_miniseg, bodypart2traj.keys()))
@@ -578,7 +753,8 @@ def main():
             if not success: break
 
             if len(bodypart2traj) > 0:
-                success &= exec_traj_maybesim(bodypart2traj, tcp_traj, tcp_poses)
+                success &= exec_traj_maybesim(bodypart2traj, tcp_traj, tcp_poses,
+                                              new_xyz-baxter2pr2offset[:3, 3], seg_info, i_start, i_end)
 
             if not success: break
 
@@ -586,13 +762,18 @@ def main():
         redprint("Segment %s result: %s"%(seg_name, success))
 
         # move back to initial position
+        baxter_move_to_initial()
         tcp_poses = copy.deepcopy(tcp_poses0)
-        baxter_move(tcp_poses)
 
         if not yes_or_no("Do you want to continue?"):
             return
 
         if args.fake_data_segment: break
+
+    ## When finished shut down moveit_commander.
+    if MOVEIT_DEBUG:
+        moveit_commander.roscpp_shutdown()
+
 
 if __name__ == "__main__":
     main()

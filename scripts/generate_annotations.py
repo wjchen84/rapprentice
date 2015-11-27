@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+usage = """
+./generate_annotations.py ../data/overhand/overhand0.bag ../data/overhand/overhand0.ann.yaml
+"""
 
 import argparse
 parser = argparse.ArgumentParser()
